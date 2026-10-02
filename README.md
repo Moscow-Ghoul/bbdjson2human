@@ -77,3 +77,9 @@ The data lists come from the site creator's repo and are refreshed every run. If
 * **After a name change in the lists:** posts aren't flagged as changed (old and new are rendered with current names). Run with `--all` to regenerate everything.
 * **Changing the look:** colours, section labels, and wording are in the settings block at the top of `bbdjson2human.py`.
 
+## Credits
+
+The perk, addon, map, item and offering lists are maintained by the creator of
+[Balanced by Daylight](https://github.com/kylestarrtech/Balanced-by-Daylight) and are
+downloaded from their repository when the script runs. This tool is an unofficial
+companion and is not affiliated with or endorsed by Balanced by Daylight or Dead by Daylight.
