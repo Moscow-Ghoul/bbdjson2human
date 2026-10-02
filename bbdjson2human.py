@@ -77,7 +77,9 @@ ALL_ADDONS_OK_PREFIX = "+"
 ALL_OTHER_ADDONS = "All other addons are allowed"   # when some addons are banned
 ALL_ADDONS = "All addons are allowed"               # when none are banned
 NONE_TEXT = "None"
-ALLOWED_PREFIX = "Allowed: "                  # whitelisted perks (green) in killer posts
+PERK_BAN_PREFIX = "-"                        # in front of each banned perk / tier line (red)
+PERK_ALLOW_PREFIX = "+"                       # in front of each allowed perk (green)
+ALLOWED_PREFIX = "Allowed: "                  # text before an allowed perk name (set "" to show just the + sign)
 COMBO_SUFFIX = " (combo)"                     # added to combo bans in killer posts
 
 # --- section labels, in the order they appear in a killer post ---
@@ -313,10 +315,12 @@ def perk_section(post, label, d, ruleset, indv, combos, tiers, general_label,
         tier_lines.append(general_label)
     green = [ALLOWED_PREFIX + n for n in sort_names(d.perk(p) for p in wl_perks)]
     green += [ALLOWED_PREFIX + n for n in sort_names(combo_name(d, c) for c in wl_combos)]
-    if not red and not green and not tier_lines:
-        red = [NONE_TEXT]
     # box 1: tier bans; box 2 (separate code box): individual bans / combos / allowed perks
-    post.add(label, seg(RED, tier_lines), BOX_BREAK, seg(RED, red), seg(GREEN, green))
+    if not red and not green and not tier_lines:
+        post.add(label, seg(RED, [NONE_TEXT]))
+        return
+    post.add(label, seg(RED, tier_lines, PERK_BAN_PREFIX), BOX_BREAK,
+             seg(RED, red, PERK_BAN_PREFIX), seg(GREEN, green, PERK_ALLOW_PREFIX))
 
 
 def item_lines(k, d, fc_count):
@@ -421,7 +425,7 @@ def tier_post(idx, tier, d, ruleset):
     ]
     for label, lines in sections:
         if lines:
-            post.add(label, seg(RED, lines))
+            post.add(label, seg(RED, lines, PERK_BAN_PREFIX))
     if not post.sections:
         post.add("Bans", seg(WHITE, [NONE_TEXT]))
     return post
