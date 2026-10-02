@@ -83,3 +83,4 @@ The perk, addon, map, item and offering lists are maintained by the creator of
 [Balanced by Daylight](https://github.com/kylestarrtech/Balanced-by-Daylight) and are
 downloaded from their repository when the script runs. This tool is an unofficial
 companion and is not affiliated with or endorsed by Balanced by Daylight or Dead by Daylight.
+Thanks to Broc for helping figure it all out.
