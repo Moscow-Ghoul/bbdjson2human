@@ -291,8 +291,8 @@ class Post:
             for n, (kind, val) in enumerate(blocks):
                 if kind == "box":
                     out.append("```ansi\n" + "\n".join(val) + "\n```")
-                else:   # a blank line after the links when a code box follows
-                    out.append(val + ("\n" if n < len(blocks) - 1 else ""))
+                else:   # links: no gap before a code box, but a blank line when they end the section
+                    out.append(val + ("\n" if n == len(blocks) - 1 else ""))
             parts.append(f"{label}:\n" + "\n".join(out))
         return "\n".join(parts)
 
