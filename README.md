@@ -4,54 +4,66 @@ Turns your [Balanced by Daylight](https://balancedbydaylight.com) ruleset (hoste
 
 ## Requirements
 
-* Python 3.8+ (no extra packages)
-* Internet connection
-* Your ruleset `.json` hosted in a GitHub repository
+- Python 3.8+ (no extra packages)
+- Internet connection
+- Your ruleset `.json` hosted in a GitHub repository
 
 ## Quick start
 
-```bash
-python bbdjson2human.py
+```
+python balance.py
 ```
 
 **First run:** the script asks for the GitHub link to your ruleset file (open the file on github.com and copy the address bar, e.g. `https://github.com/<user>/<repo>/blob/main/Ruleset.json`). It saves the link in `config.json` and doesn't ask again.
 
 **Every run:**
-
 1. Downloads the newest perk / addon / map / item / offering lists from the site creator's repo.
 2. Downloads your newest ruleset from GitHub.
 3. Compares it to the version you last posted and prints what changed, per killer and tier.
-4. Writes the changed posts to `output/<date>_<commit>/`, one `.txt` per post (named after the killer or tier, containing only the post body).
-5. Asks: *"Did you post these? (would you like to update the saved ruleset to the latest version?)"*
-
-   * `y` → saves this version as your baseline; the next run compares against it.
-   * `n` (or close the window) → nothing is saved; the same changes show up next time.
+4. Writes the changed **tier posts** first, then asks for the Discord link of each tier post (see below).
+5. Writes the changed **killer posts**, with those links in place of the tier lines. Every post is one `.txt` in `output/<date>_<commit>/`, named after the killer or tier and containing only the post body.
+6. Asks: *"Did you post these? (would you like to update the saved ruleset to the latest version?)"*
+   - `y` → saves this version as your baseline; the next run compares against it.
+   - `n` (or close the window) → nothing is saved; the same changes show up next time.
 
 The very first run has no baseline, so every post is written.
 
+## Tier post links
+
+Killer posts link to the tier posts instead of listing a text line like "B Tier bans".
+
+1. The script writes the tier posts first and tells you which ones to publish.
+2. Publish them in Discord, then paste each post's link when asked (right-click the post → Copy link).
+3. Killer posts then show that link, followed by the killer's individual bans.
+
+Links are saved in `tier_links.json`, so each is asked once. A tier is asked about again when its post changed (press Enter to keep the saved link, or paste the new one if you made a new post). If a tier has no link (you pressed Enter), killer posts show the plain text line for that tier, and you're asked again next run. If a tier's link changes, every killer post that uses that tier is flagged as changed.
+
 ## Options
 
-| Option                | What it does                                                                          |
-| --------------------- | ------------------------------------------------------------------------------------- |
-| *(none)*              | The normal run described above.                                                       |
-| `--all`               | Write every post, not just the changed ones.                                          |
-| `--print`             | Also print the written posts in the terminal.                                         |
-| `--no-save`           | Preview only: never updates the saved "last posted" version (no question at the end). |
-| `--since <commit id>` | Compare against a specific older version of your ruleset instead of the saved one.    |
-| `--set-url [LINK]`    | Change the saved ruleset link. Give the link, or leave it empty to be asked.          |
-| `--no-data-update`    | Skip downloading the perk/addon/map/item/offering lists (use the copies in `data/`).  |
-| `--data <folder>`     | Use a different folder for the data lists (default: `data/`).                         |
-| `--out <folder>`      | Write posts to a different folder (default: `output/`).                               |
-| `<file.json>`         | Use a local ruleset file instead of GitHub (no comparison, nothing saved).            |
+| Option | What it does |
+|---|---|
+| *(none)* | The normal run described above. |
+| `--all` | Write every post, not just the changed ones. |
+| `--print` | Also print the written posts in the terminal. |
+| `--no-save` | Preview only: never updates the saved "last posted" version, and doesn't ask for tier links. |
+| `--links` | Ask for every tier post's link again (Enter keeps the saved one). Use it after reposting a tier post. |
+| `--no-links` | Never ask for tier post links (saved links are still used). |
+| `--since <commit id>` | Compare against a specific older version of your ruleset instead of the saved one. |
+| `--set-url [LINK]` | Change the saved ruleset link. Give the link, or leave it empty to be asked. |
+| `--no-data-update` | Skip downloading the perk/addon/map/item/offering lists (use the copies in `data/`). |
+| `--data <folder>` | Use a different folder for the data lists (default: `data/`). |
+| `--out <folder>` | Write posts to a different folder (default: `output/`). |
+| `<file.json>` | Use a local ruleset file instead of GitHub (no comparison, nothing saved). |
 
 Examples:
 
-```bash
-python bbdjson2human.py --all
-python bbdjson2human.py --print --no-save
-python bbdjson2human.py --since 2a90a65
-python bbdjson2human.py --set-url
-python bbdjson2human.py MyRuleset.json
+```
+python balance.py --all
+python balance.py --print --no-save
+python balance.py --since 2a90a65
+python balance.py --set-url
+python balance.py --links
+python balance.py MyRuleset.json
 ```
 
 ## Unknown IDs (after a DBD update)
@@ -60,22 +72,23 @@ The data lists come from the site creator's repo and are refreshed every run. If
 
 ## Files it creates
 
-| Path               | Purpose                                              |
-| ------------------ | ---------------------------------------------------- |
-| `config.json`      | Your saved ruleset link.                             |
-| `last_posted.json` | The GitHub version (commit id) you last posted.      |
-| `data/`            | The downloaded data lists, plus `custom_names.json`. |
-| `output/`          | One folder per run containing the post files.        |
+| Path | Purpose |
+|---|---|
+| `config.json` | Your saved ruleset link. |
+| `last_posted.json` | The GitHub version (commit id) you last posted, and the tier links in use then. |
+| `tier_links.json` | The Discord links to your tier posts. |
+| `data/` | The downloaded data lists, plus `custom_names.json`. |
+| `output/` | One folder per run containing the post files. |
 
 ## Good to know
 
-* **Special notes:** "Two firecrackers are allowed!" becomes `Firecracker x2` in Items, and "Double Vigo's Shroud must be used!" becomes `Vigo's Shroud x2` in Survivor offerings. Those notes are then left out of the Notes block.
-* **Pasting:** the post files contain real Discord `ansi` colour codes (invisible characters). Copy the whole file content and paste it into the forum post.
-* **Length:** Discord limits a message to 2000 characters. The script doesn't split posts; the General tier post is usually the one that goes over.
-* **Private repo:** set an environment variable `GITHUB_TOKEN` to a personal access token with read access.
-* **Rate limits:** if GitHub's API is busy, the script falls back to GitHub's public commit feed automatically.
-* **After a name change in the lists:** posts aren't flagged as changed (old and new are rendered with current names). Run with `--all` to regenerate everything.
-* **Changing the look:** colours, section labels, and wording are in the settings block at the top of `bbdjson2human.py`.
+- **Special notes:** "Two firecrackers are allowed!" becomes `Firecracker x2` in Items, and "Double Vigo's Shroud must be used!" becomes `Vigo's Shroud x2` in Survivor offerings. Those notes are then left out of the Notes block. Other notes stay in Notes.
+- **Pasting:** the post files contain real Discord `ansi` colour codes (invisible characters). Copy the whole file content and paste it into the forum post.
+- **Length:** Discord limits a message to 2000 characters. The script doesn't split posts; the General tier post is usually the one that goes over.
+- **Private repo:** set an environment variable `GITHUB_TOKEN` to a personal access token with read access.
+- **Rate limits:** if GitHub's API is busy, the script falls back to GitHub's public commit feed automatically.
+- **After a name change in the lists:** posts aren't flagged as changed (old and new are rendered with current names). Run with `--all` to regenerate everything.
+- **Changing the look:** colours, section labels, and wording are in the settings block at the top of `balance.py`.
 
 ## Credits
 
