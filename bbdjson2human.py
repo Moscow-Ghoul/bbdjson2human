@@ -6,6 +6,8 @@ USAGE
     python balance.py                      # fetch the ruleset from GitHub, show what changed, write posts
                                            # (first run asks for your ruleset's GitHub link and remembers it)
     python balance.py --set-url [LINK]     # change the saved ruleset link
+    python balance.py --links              # ask for every tier post's Discord link again
+    python balance.py --no-links           # don't ask for tier post links (saved ones are still used)
     python balance.py --all                # write every post, not only the changed ones
     python balance.py --print              # also show the written posts in the terminal
     python balance.py --no-save            # preview only; never touches the saved "last posted" marker
@@ -19,6 +21,8 @@ HOW IT WORKS
     downloaded from GitHub again, so nothing else needs to be stored here.
   * The posts built from the old and the new version are compared, and only posts that differ are written
     to output/<date>_<commit>/ - one .txt per post, containing just the post body.
+  * Tier posts come first. After you post them, paste each post's Discord link: killer posts then show
+    that link instead of the 'S Tier bans' text line. Links are remembered in tier_links.json.
   * The perk/addon/map/item/offering lists are refreshed from the site creator's repo every run (DATA_SOURCES).
   * Perk / addon / map / item / offering IDs the data files don't know are asked about in the terminal and
     remembered in data/custom_names.json.
@@ -50,6 +54,7 @@ BASE = Path(__file__).resolve().parent
 # ============================================================================
 CONFIG_FILE = BASE / "config.json"        # remembers your ruleset link (asked on the first run)
 STATE_FILE = BASE / "last_posted.json"
+TIER_LINKS_FILE = BASE / "tier_links.json"  # Discord links to your tier posts
 
 # Where the perk / map / item / addon / offering lists come from (maintained by the site's creator).
 # Downloaded into data/ on every run; if the download fails, the saved copies in data/ are used.
@@ -268,17 +273,27 @@ class Post:
     def body(self):
         parts = []
         for label, segments in self.sections:
-            boxes, current = [], []
+            blocks, current = [], []
             for colour, lines, prefix in segments:
-                if colour == "BREAK":
-                    boxes.append(current)
+                if colour in ("BREAK", "TEXT") and current:
+                    blocks.append(("box", current))
                     current = []
+                if colour == "BREAK":
+                    continue
+                if colour == "TEXT":            # plain lines outside any code box (links)
+                    blocks.append(("text", "\n".join(lines)))
                     continue
                 text = "\n".join(prefix + ln for ln in lines)
                 current.append(f"{ESC}[2;{colour}m{text}{ESC}[0m" if colour else text)
-            boxes.append(current)
-            blocks = ["```ansi\n" + "\n".join(b) + "\n```" for b in boxes if b]
-            parts.append(f"{label}:\n" + "\n".join(blocks))
+            if current:
+                blocks.append(("box", current))
+            out = []
+            for n, (kind, val) in enumerate(blocks):
+                if kind == "box":
+                    out.append("```ansi\n" + "\n".join(val) + "\n```")
+                else:   # a blank line after the links when a code box follows
+                    out.append(val + ("\n" if n < len(blocks) - 1 else ""))
+            parts.append(f"{label}:\n" + "\n".join(out))
         return "\n".join(parts)
 
     def flat(self):
@@ -307,20 +322,34 @@ def combo_name(d, combo):
 
 
 def perk_section(post, label, d, ruleset, indv, combos, tiers, general_label,
-                 wl_perks, wl_combos):
+                 wl_perks, wl_combos, links):
     red = sort_names(d.perk(p) for p in indv)
     red += sort_names(combo_name(d, c) + COMBO_SUFFIX for c in combos)
-    tier_lines = [TIER_POINTER.format(name=tier_name(ruleset, t)) for t in sorted(tiers) if t != 0]
-    if 0 in tiers:
-        tier_lines.append(general_label)
     green = [ALLOWED_PREFIX + n for n in sort_names(d.perk(p) for p in wl_perks)]
     green += [ALLOWED_PREFIX + n for n in sort_names(combo_name(d, c) for c in wl_combos)]
-    # box 1: tier bans; box 2 (separate code box): individual bans / combos / allowed perks
-    if not red and not green and not tier_lines:
+
+    # tier lines: a link to that tier's post if we have one, otherwise the plain text line
+    link_lines, text_lines = [], []
+    for t in sorted(x for x in tiers if x != 0) + ([0] if 0 in tiers else []):
+        url = links.get(str(ruleset["Tiers"][t]["Name"]))
+        if url:
+            link_lines.append(url)
+        else:
+            text_lines.append(general_label if t == 0 else
+                              TIER_POINTER.format(name=tier_name(ruleset, t)))
+
+    if not red and not green and not link_lines and not text_lines:
         post.add(label, seg(RED, [NONE_TEXT]))
         return
-    post.add(label, seg(RED, tier_lines, PERK_BAN_PREFIX), BOX_BREAK,
-             seg(RED, red, PERK_BAN_PREFIX), seg(GREEN, green, PERK_ALLOW_PREFIX))
+    # links (plain text) -> tier lines without a link (code box) -> individual bans (code box)
+    segs = []
+    if link_lines:
+        segs.append(seg("TEXT", link_lines))
+    if text_lines:
+        segs.append(seg(RED, text_lines, PERK_BAN_PREFIX))
+    segs.append(BOX_BREAK)
+    segs += [seg(RED, red, PERK_BAN_PREFIX), seg(GREEN, green, PERK_ALLOW_PREFIX)]
+    post.add(label, *segs)
 
 
 def item_lines(k, d, fc_count):
@@ -344,7 +373,7 @@ def item_lines(k, d, fc_count):
     return (lines or ["No items"]), used_fc
 
 
-def killer_post(k, d, ruleset):
+def killer_post(k, d, ruleset, links):
     name = k["Name"]
     post = Post(name)
 
@@ -370,11 +399,11 @@ def killer_post(k, d, ruleset):
     d.ctx = f"{name} > Killer perks"
     perk_section(post, L_KPERKS, d, ruleset, k["KillerIndvPerkBans"], k["KillerComboPerkBans"],
                  k["BalanceTiers"], GENERAL_POINTER_KILLER,
-                 k["KillerWhitelistedPerks"], k["KillerWhitelistedComboPerks"])
+                 k["KillerWhitelistedPerks"], k["KillerWhitelistedComboPerks"], links)
     d.ctx = f"{name} > Survivor perks"
     perk_section(post, L_SPERKS, d, ruleset, k["SurvivorIndvPerkBans"], k["SurvivorComboPerkBans"],
                  k["SurvivorBalanceTiers"], GENERAL_POINTER_SURVIVOR,
-                 k["SurvivorWhitelistedPerks"], k["SurvivorWhitelistedComboPerks"])
+                 k["SurvivorWhitelistedPerks"], k["SurvivorWhitelistedComboPerks"], links)
 
     d.ctx = f"{name} > Items"
     lines, used_fc = item_lines(k, d, fc_count)
@@ -431,17 +460,29 @@ def tier_post(idx, tier, d, ruleset):
     return post
 
 
-def build_all(ruleset, d):
+def build_tier_posts(ruleset, d):
+    return {f"tier:{t['Name']}": tier_post(i, t, d, ruleset) for i, t in enumerate(ruleset["Tiers"])}
+
+
+def build_killer_posts(ruleset, d, links):
     posts = {}
     for k in ruleset["KillerOverride"]:
         if k.get("IsDisabled"):
             if not d.silent:
                 d.warnings.add(f"{k['Name']} is disabled in the ruleset - no post generated")
             continue
-        posts[f"killer:{k['Name']}"] = killer_post(k, d, ruleset)
-    for i, t in enumerate(ruleset["Tiers"]):
-        posts[f"tier:{t['Name']}"] = tier_post(i, t, d, ruleset)
+        posts[f"killer:{k['Name']}"] = killer_post(k, d, ruleset, links)
     return posts
+
+
+def referenced_tiers(ruleset):
+    """Names of the tiers that at least one killer post points to (they need a link)."""
+    used = set()
+    for k in ruleset["KillerOverride"]:
+        if not k.get("IsDisabled"):
+            used.update(k["BalanceTiers"])
+            used.update(k["SurvivorBalanceTiers"])
+    return [str(ruleset["Tiers"][i]["Name"]) for i in sorted(used) if 0 <= i < len(ruleset["Tiers"])]
 
 
 # ----------------------------------------------------------------------------
@@ -613,6 +654,61 @@ def get_ruleset_url(set_url_arg):
 
 
 # ----------------------------------------------------------------------------
+# Links to the tier posts (asked once per tier post, remembered in tier_links.json)
+# ----------------------------------------------------------------------------
+def load_tier_links(url_key):
+    if TIER_LINKS_FILE.exists():
+        try:
+            return dict(json.loads(TIER_LINKS_FILE.read_text(encoding="utf-8")).get(url_key, {}))
+        except (ValueError, AttributeError):
+            pass
+    return {}
+
+
+def save_tier_links(url_key, links):
+    allv = {}
+    if TIER_LINKS_FILE.exists():
+        try:
+            allv = json.loads(TIER_LINKS_FILE.read_text(encoding="utf-8"))
+        except ValueError:
+            allv = {}
+    allv[url_key] = links
+    TIER_LINKS_FILE.write_text(json.dumps(allv, indent=1), encoding="utf-8")
+
+
+def ask_tier_links(ruleset, tier_posts, to_post, links, url_key, force):
+    """Ask for the Discord link of every tier post that needs one."""
+    todo = []
+    for name in referenced_tiers(ruleset):
+        if force or f"tier:{name}" in to_post or not links.get(name):
+            todo.append(name)
+    if not todo:
+        return
+    title = {n: tier_posts[f"tier:{n}"].title for n in todo}
+    fresh = [title[n] for n in todo if f"tier:{n}" in to_post]
+    print("\n== Tier links ==")
+    print("Killer posts link to the tier posts.")
+    if fresh:
+        print("Post these tier posts first: " + ", ".join(fresh))
+    print("Paste each post's Discord link (right-click the post > Copy link).\n")
+    for name in todo:
+        saved = links.get(name)
+        hint = f" [saved: {saved}] (Enter keeps it)" if saved else " (Enter skips: killer posts will show plain text)"
+        while True:
+            try:
+                ans = input(f"Link for '{title[name]}'{hint}: ").strip()
+            except EOFError:
+                ans = ""
+            if not ans:
+                break
+            if re.match(r"https?://\S+$", ans):
+                links[name] = ans
+                save_tier_links(url_key, links)
+                break
+            print("  ! That doesn't look like a link (it should start with https://). Try again.")
+
+
+# ----------------------------------------------------------------------------
 # Comparison + report
 # ----------------------------------------------------------------------------
 def diff_lines(old_flat, new_flat):
@@ -638,9 +734,6 @@ def compare(new, old):
 
 
 def print_report(changes, new, old):
-    if not changes:
-        print("No post changes.")
-        return
     for key, status, rem, add in changes:
         post = new.get(key) or old[key]
         kind = "Tier post" if key.startswith("tier:") else "Killer"
@@ -655,6 +748,12 @@ def print_report(changes, new, old):
                     print(f"      - {sec}: {r[2]}")
                 for a in (a for a in add if a[0] == sec):
                     print(f"      + {sec}: {a[2]}")
+
+
+def print_summary(changes):
+    if not changes:
+        print("\nNo post changes.")
+        return
     counts = {s: sum(1 for c in changes if c[1] == s) for s in ("new", "changed", "removed")}
     print(f"\nSummary: {counts['new']} new, {counts['changed']} changed, {counts['removed']} removed")
     if counts["removed"]:
@@ -665,15 +764,20 @@ def safe_name(s):
     return re.sub(r'[<>:"/\\|?*]', "", s).strip() or "post"
 
 
-def write_posts(posts, keys, out_root, tag):
-    if not keys:
-        return None
-    folder = Path(out_root) / f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}_{tag}"
-    folder.mkdir(parents=True, exist_ok=True)
-    for key in keys:
-        p = posts[key]
-        (folder / f"{safe_name(p.title)}.txt").write_text(p.body(), encoding="utf-8", newline="\n")
-    return folder
+class Out:
+    """Writes post files into one output folder per run (created on first write)."""
+    def __init__(self, root, tag):
+        self.root, self.tag, self.folder, self.written = Path(root), tag, None, []
+
+    def write(self, posts, keys):
+        for key in keys:
+            if self.folder is None:
+                stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+                self.folder = self.root / f"{stamp}_{self.tag}"
+                self.folder.mkdir(parents=True, exist_ok=True)
+            p = posts[key]
+            (self.folder / f"{safe_name(p.title)}.txt").write_text(p.body(), encoding="utf-8", newline="\n")
+            self.written.append(p)
 
 
 # ----------------------------------------------------------------------------
@@ -688,8 +792,8 @@ def load_state():
     return {}
 
 
-def save_state(commit, url):
-    STATE_FILE.write_text(json.dumps({"url": url, "sha": commit["sha"], "date": commit["date"],
+def save_state(commit, url, links):
+    STATE_FILE.write_text(json.dumps({"url": url, "tier_links": links, "sha": commit["sha"], "date": commit["date"],
                                       "message": commit["message"],
                                       "saved_at": datetime.now().isoformat(timespec="seconds")},
                                      indent=1), encoding="utf-8")
@@ -715,6 +819,10 @@ def main():
                     help="do not download the newest perk/addon/map/item/offering lists")
     ap.add_argument("--set-url", nargs="?", const="ASK", default=None, metavar="LINK",
                     help="change the saved ruleset link (give the link, or leave empty to be asked)")
+    ap.add_argument("--links", action="store_true",
+                    help="ask for every tier post's link again (Enter keeps the saved one)")
+    ap.add_argument("--no-links", action="store_true",
+                    help="never ask for tier post links (saved links are still used)")
     ap.add_argument("--since", help="compare against this GitHub commit id instead of the saved one")
     args = ap.parse_args()
 
@@ -760,34 +868,67 @@ def main():
             except (GitHubError, ValueError) as e:
                 print(f"Could not load your last posted version ({e}) - treating every post as new.")
 
-    print(f"Ruleset: {new_rs.get('Name')}\n")
-    posts = build_all(new_rs, d)
+    print(f"Ruleset: {new_rs.get('Name')}")
+    url_key = "local" if local else url
+    links = load_tier_links(url_key)
+    baseline_links = {} if local else dict(state.get("tier_links", {}))
+    out = Out(args.out, "local" if local else latest["sha"][:7])
 
-    old_posts = None
-    if old_rs is not None:
+    def old_build(fn, *a):
+        """Render the OLD version quietly; None if there is no old version or it can't be read."""
+        if old_rs is None:
+            return None
         d.silent = True
         try:
-            old_posts = build_all(old_rs, d)
+            return fn(old_rs, d, *a)
         except (KeyError, TypeError, IndexError, ValueError) as e:
             print(f"Could not read the old version's format ({e!r}) - treating every post as new.")
-        d.silent = False
+            return None
+        finally:
+            d.silent = False
 
-    changes = compare(posts, old_posts)
-    print_report(changes, posts, old_posts)
+    # --- 1) tier posts first
+    print("\n== Tier posts (post these first) ==")
+    tier_new = build_tier_posts(new_rs, d)
+    tier_old = old_build(build_tier_posts)
+    tier_changes = compare(tier_new, tier_old)
+    if tier_changes:
+        print_report(tier_changes, tier_new, tier_old)
+    else:
+        print("No tier post changes.")
+    tier_keys = list(tier_new) if args.all else [c[0] for c in tier_changes if c[0] in tier_new]
+    out.write(tier_new, tier_keys)
+
+    # --- 2) ask for the links to those posts
+    if sys.stdin.isatty() and not (local or args.no_save or args.no_links):
+        ask_tier_links(new_rs, tier_new, set(tier_keys), links, url_key, args.links)
+
+    # --- 3) killer posts (with the links)
+    print("\n== Killer posts ==")
+    killer_new = build_killer_posts(new_rs, d, links)
+    killer_old = old_build(build_killer_posts, baseline_links)
+    killer_changes = compare(killer_new, killer_old)
+    if killer_changes:
+        print_report(killer_changes, killer_new, killer_old)
+    else:
+        print("No killer post changes.")
+    killer_keys = list(killer_new) if args.all else [c[0] for c in killer_changes if c[0] in killer_new]
+    out.write(killer_new, killer_keys)
+
+    changes = tier_changes + killer_changes
+    print_summary(changes)
 
     if d.warnings:
         print("\nWarnings:")
         for w in sorted(d.warnings):
             print("  !", w)
 
-    to_write = list(posts) if args.all else [c[0] for c in changes if c[0] in posts]
-    folder = write_posts(posts, to_write, args.out, "local" if local else latest["sha"][:7])
-    if folder:
-        print(f"\nWrote {len(to_write)} post file(s) to: {folder}")
+    if out.folder:
+        print(f"\nWrote {len(out.written)} post file(s) to: {out.folder}")
         if args.show:
-            for key in to_write:
-                print("\n" + "=" * 60 + f"\n{posts[key].title}\n" + "=" * 60)
-                print(posts[key].body())
+            for p in out.written:
+                print("\n" + "=" * 60 + f"\n{p.title}\n" + "=" * 60)
+                print(p.body())
     else:
         print("\nNothing to post.")
 
@@ -797,16 +938,15 @@ def main():
         if sys.stdin.isatty():
             print()
             if confirm("Did you post these? (would you like to update the saved ruleset to the latest version?)"):
-                save_state(latest, url)
+                save_state(latest, url, links)
                 print("Saved. Next run will compare against this version.")
             else:
                 print("Not saved - these changes will show up again next run.")
         else:
             print("\n(Not running in a terminal, so I did not ask whether to update the saved version.)")
-    elif state.get("sha") != latest["sha"]:
-        save_state(latest, url)
+    elif state.get("sha") != latest["sha"] or state.get("tier_links", {}) != links:
+        save_state(latest, url, links)
         print("Saved the latest version as your last posted version (nothing needed posting).")
-
 
 if __name__ == "__main__":
     try:
