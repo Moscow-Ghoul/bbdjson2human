@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
 """
-balance.py - turn your Balanced by Daylight ruleset (hosted on GitHub) into Discord forum posts.
+bbdjson2human.py - turn your Balanced by Daylight ruleset (hosted on GitHub) into Discord forum posts.
 
 USAGE
-    python balance.py                      # fetch the ruleset from GitHub, show what changed, write posts
+    python bbdjson2human.py                      # fetch the ruleset from GitHub, show what changed, write posts
                                            # (first run asks for your ruleset's GitHub link and remembers it)
-    python balance.py --set-url [LINK]     # change the saved ruleset link
-    python balance.py --links              # ask for every tier post's Discord link again
-    python balance.py --no-links           # don't ask for tier post links (saved ones are still used)
-    python balance.py --all                # write every post, not only the changed ones
-    python balance.py --print              # also show the written posts in the terminal
-    python balance.py --no-save            # preview only; never touches the saved "last posted" marker
-    python balance.py --no-data-update     # skip downloading the newest perk/addon/map/item lists
-    python balance.py --since <commit id>  # compare against a specific older GitHub version
-    python balance.py path/to/ruleset.json # use a local file instead of GitHub (no comparison / saving)
+    python bbdjson2human.py --set-url [LINK]     # change the saved ruleset link
+    python bbdjson2human.py --links              # ask for every tier post's Discord link again
+    python bbdjson2human.py --no-links           # don't ask for tier post links (saved ones are still used)
+    python bbdjson2human.py --test               # publish only 3 posts (General, one tier post, one killer)
+    python bbdjson2human.py --dry-run            # show what would be published, send nothing
+    python bbdjson2human.py --yes                # publish without asking for confirmation
+    python bbdjson2human.py --no-publish         # write post files instead of publishing
+    python bbdjson2human.py --set-webhook [URL]  # change the saved webhook
+    python bbdjson2human.py --set-tags           # enter the tier tag IDs again
+    python bbdjson2human.py --set-images [DIR]   # change the folder with your post pictures
+    python bbdjson2human.py --all                # (file mode) write every post, not only the changed ones
+    python bbdjson2human.py --print              # also show the written posts in the terminal
+    python bbdjson2human.py --no-save            # preview only; never touches the saved "last posted" marker
+    python bbdjson2human.py --no-data-update     # skip downloading the newest perk/addon/map/item lists
+    python bbdjson2human.py --since <commit id>  # compare against a specific older GitHub version
+    python bbdjson2human.py path/to/ruleset.json # use a local file instead of GitHub (no comparison / saving)
 
-HOW IT WORKS
+HOW IT WORKS (publishing)
+  * With a webhook saved, the script publishes straight to your Discord forum: tier posts first, then killer
+    posts that link to them. published.json remembers every post and message, so later runs EDIT the
+    messages that changed and leave everything else alone. See README.md.
+
+HOW IT WORKS (files, with --no-publish)
   * Every run downloads the newest ruleset from GitHub (the link is saved in config.json).
   * last_posted.json remembers the GitHub version (commit id) you last posted. The old version is
     downloaded from GitHub again, so nothing else needs to be stored here.
@@ -36,13 +48,17 @@ PRIVATE REPO? Set an environment variable GITHUB_TOKEN to a personal access toke
 """
 
 import argparse
+import hashlib
 import json
+import mimetypes
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -271,6 +287,9 @@ class Post:
         self.sections.append((label, [s for s in segments if s and (s[1] or s is BOX_BREAK)]))
 
     def body(self):
+        return "\n".join(self.section_texts())
+
+    def section_texts(self):
         parts = []
         for label, segments in self.sections:
             blocks, current = [], []
@@ -294,7 +313,7 @@ class Post:
                 else:   # links: no gap before a code box, but a blank line when they end the section
                     out.append(val + ("\n" if n == len(blocks) - 1 else ""))
             parts.append(f"{label}:\n" + "\n".join(out))
-        return "\n".join(parts)
+        return parts
 
     def flat(self):
         """[[section, colour, line], ...] - used for the change report."""
@@ -542,7 +561,7 @@ def get_commits(gh):
                         "message": (e.find("a:title", ns).text or "").strip(),
                         "date": e.find("a:updated", ns).text[:10]})
     if not commits:
-        raise GitHubError("No commits found for that file - check your ruleset link (python balance.py --set-url).")
+        raise GitHubError("No commits found for that file - check your ruleset link (python bbdjson2human.py --set-url).")
     return commits
 
 
@@ -646,7 +665,7 @@ def get_ruleset_url(set_url_arg):
         url = ask_for_url()
     else:
         sys.exit("No ruleset link saved yet. Run the script in a terminal to enter it, "
-                 "or use:  python balance.py --set-url <github link>")
+                 "or use:  python bbdjson2human.py --set-url <github link>")
     cfg["ruleset_url"] = url
     CONFIG_FILE.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     print(f"Saved ruleset link to {CONFIG_FILE.name}.\n")
@@ -706,6 +725,483 @@ def ask_tier_links(ruleset, tier_posts, to_post, links, url_key, force):
                 save_tier_links(url_key, links)
                 break
             print("  ! That doesn't look like a link (it should start with https://). Try again.")
+
+
+# ----------------------------------------------------------------------------
+# Publishing to Discord through a webhook
+# ----------------------------------------------------------------------------
+DISCORD_API = os.environ.get("BALANCE_DISCORD_API", "https://discord.com/api/v10").rstrip("/")
+PACE = float(os.environ.get("BALANCE_PACE", "0.7"))    # seconds to wait between Discord requests
+LEDGER_FILE = BASE / "published.json"                  # remembers what was published where
+MSG_LIMIT = 2000                                       # Discord's message length limit
+TITLE_LIMIT = 100                                      # Discord's post title length limit
+TIER_LETTERS = ["S", "A", "B", "C", "D"]
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+UA = "DiscordBot (balance-posts-script, 1.0)"
+WEBHOOK_RE = re.compile(r"https?://(?:[\w.-]+\.)?discord(?:app)?\.com/api(?:/v\d+)?/webhooks/(\d+)/([\w-]+)")
+
+
+class DiscordError(Exception):
+    def __init__(self, status, code, text):
+        super().__init__(f"Discord error {status}" + (f" (code {code})" if code else "") + f": {text}")
+        self.status, self.code, self.text = status, code, text
+
+
+def save_config(cfg):
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+
+
+def parse_webhook(url):
+    m = WEBHOOK_RE.search(url.strip())
+    if not m:
+        raise ValueError("That doesn't look like a Discord webhook URL "
+                         "(https://discord.com/api/webhooks/<number>/<token>).")
+    return {"id": m[1], "token": m[2]}
+
+
+def get_webhook(set_arg):
+    """Saved webhook (asked once). None = don't publish, write files instead."""
+    cfg = load_config()
+    if set_arg is None and cfg.get("webhook_url"):
+        return parse_webhook(cfg["webhook_url"])
+    if set_arg not in (None, "ASK"):
+        url = set_arg
+        try:
+            hook = parse_webhook(url)
+        except ValueError as e:
+            sys.exit(str(e))
+    elif sys.stdin.isatty():
+        print("Paste the webhook URL of your forum channel (Channel settings > Integrations > Webhooks).")
+        print("Treat it like a password: anyone who has it can post in your forum. Never share or upload it.\n")
+        while True:
+            try:
+                url = input("Webhook URL (Enter = write files instead, this time): ").strip()
+            except EOFError:
+                url = ""
+            if not url:
+                return None
+            try:
+                hook = parse_webhook(url)
+                break
+            except ValueError as e:
+                print(f"  ! {e}\n")
+    else:
+        print("No webhook saved, so posts are written as files. "
+              "Run in a terminal to set one up (or: python bbdjson2human.py --set-webhook <url>).\n")
+        return None
+    cfg["webhook_url"] = url
+    save_config(cfg)
+    print(f"Saved webhook to {CONFIG_FILE.name}. Keep that file private.\n")
+    return hook
+
+
+def build_multipart(payload, files):
+    boundary = "----balance" + uuid.uuid4().hex
+    parts = [(f'--{boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\n'
+              f'Content-Type: application/json\r\n\r\n').encode() + json.dumps(payload).encode("utf-8") + b"\r\n"]
+    for n, (fname, data, ctype) in enumerate(files):
+        parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="files[{n}]"; '
+                      f'filename="{fname}"\r\nContent-Type: {ctype}\r\n\r\n').encode() + data + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+class Discord:
+    """Tiny Discord webhook client (create posts / messages, edit messages)."""
+    def __init__(self, hook):
+        self.id, self.token = hook["id"], hook["token"]
+
+    def request(self, method, path="", query=None, payload=None, files=None):
+        url = f"{DISCORD_API}/webhooks/{self.id}/{self.token}{path}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        headers = {"User-Agent": UA}
+        body = None
+        if files:
+            body, headers["Content-Type"] = build_multipart(payload, files)
+        elif payload is not None:
+            body, headers["Content-Type"] = json.dumps(payload).encode("utf-8"), "application/json"
+        for attempt in range(6):
+            try:
+                req = urllib.request.Request(url, data=body, method=method, headers=headers)
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    raw = r.read()
+                time.sleep(PACE)
+                return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as e:
+                raw = e.read()
+                try:
+                    info = json.loads(raw)
+                except ValueError:
+                    info = {}
+                if e.code == 429:
+                    wait = float(info.get("retry_after") or e.headers.get("Retry-After") or 2)
+                    print(f"  (Discord asked us to slow down - waiting {wait:.1f}s)")
+                    time.sleep(wait + 0.25)
+                    continue
+                if e.code >= 500 and attempt < 3:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                raise DiscordError(e.code, info.get("code"),
+                                   info.get("message") or raw[:200].decode("utf-8", "replace"))
+            except urllib.error.URLError as e:
+                if attempt < 2:
+                    time.sleep(2)
+                    continue
+                raise DiscordError(0, None, f"Could not reach Discord ({e.reason})")
+        raise DiscordError(429, None, "still rate limited after several tries")
+
+
+def load_ledger():
+    if LEDGER_FILE.exists():
+        try:
+            return json.loads(LEDGER_FILE.read_text(encoding="utf-8"))
+        except ValueError:
+            pass
+    return {}
+
+
+def save_ledger(ledger):
+    LEDGER_FILE.write_text(json.dumps(ledger, indent=1, ensure_ascii=False), encoding="utf-8")
+
+
+def sha(text):
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def thread_link(entry, thread_id):
+    return f"https://discord.com/channels/{entry.get('guild_id')}/{thread_id}"
+
+
+def killer_tier_letter(k, ruleset):
+    """Tier of a killer: the one letter shared by killer bans (General = D) and survivor bans (General = S)."""
+    names = [str(t["Name"]).upper() for t in ruleset["Tiers"]]
+    ks = {"D" if i == 0 else names[i] for i in k["BalanceTiers"]}
+    ss = {"S" if i == 0 else names[i] for i in k["SurvivorBalanceTiers"]}
+    both = ks & ss
+    return next(iter(both)) if len(both) == 1 else None
+
+
+def ask_tag_ids(cfg, force):
+    tags = cfg.setdefault("tag_ids", {})
+    todo = [t for t in TIER_LETTERS if force or t not in tags]
+    if not todo or not sys.stdin.isatty():
+        return
+    print("\nTier tags: paste the tag ID for each tier (Enter = don't tag that tier).")
+    for t in todo:
+        while True:
+            try:
+                ans = input(f"Tag ID for tier {t}: ").strip()
+            except EOFError:
+                ans = ""
+            if not ans:
+                tags[t] = None
+                break
+            if ans.isdigit():
+                tags[t] = ans
+                break
+            print("  ! Tag IDs are numbers only.")
+    save_config(cfg)
+
+
+def norm_name(s):
+    return re.sub(r"[^a-z0-9]", "", re.sub(r"^the\s+", "", s.strip().lower()))
+
+
+def resolve_image(cfg, title):
+    """Picture file for a post (asks once if it can't be matched). None = no picture."""
+    folder = cfg.get("images_dir")
+    if folder is None:
+        if not sys.stdin.isatty():
+            return None
+        try:
+            folder = input("\nFolder with your post pictures (Enter = publish without pictures): ").strip().strip('"')
+        except EOFError:
+            folder = ""
+        cfg["images_dir"] = folder
+        save_config(cfg)
+    if not folder:
+        return None
+    root = Path(folder).expanduser()
+    saved = cfg.setdefault("image_map", {})
+    if saved.get(title) and (root / saved[title]).is_file():
+        return root / saved[title]
+    files = [f for f in root.iterdir() if f.suffix.lower() in IMAGE_EXTS] if root.is_dir() else []
+    wanted = [norm_name(title)]
+    m = re.match(r"tier ([a-z])$", title.strip().lower())
+    if m:
+        wanted += [m[1] + "tier", m[1]]
+    for want in wanted:
+        for f in files:
+            if norm_name(f.stem) == want:
+                return f
+    if not sys.stdin.isatty():
+        return None
+    while True:
+        try:
+            ans = input(f"No picture found for '{title}'. File name in {root} (Enter = no picture): ").strip().strip('"')
+        except EOFError:
+            ans = ""
+        if not ans:
+            return None
+        p = root / ans
+        if p.is_file():
+            saved[title] = ans
+            save_config(cfg)
+            return p
+        print("  ! That file doesn't exist.")
+
+
+def message_map(post, split):
+    """{message key: text}. The General post is split into one message per category."""
+    if split:
+        return {label: text for (label, _), text in zip(post.sections, post.section_texts())}
+    return {"body": post.body()}
+
+
+def plan_post(post, split, rec):
+    msgs = message_map(post, split)
+    have = rec["messages"] if rec else {}
+    create = [m for m in msgs if m not in have]
+    edit = [m for m in msgs if m in have and have[m]["hash"] != sha(msgs[m])]
+    skipped = [m for m in create + edit if len(msgs[m]) > MSG_LIMIT]
+    create = [m for m in create if m not in skipped]
+    edit = [m for m in edit if m not in skipped]
+    orphans = [m for m in have if m not in msgs]
+    if rec is None:
+        status = "new" if create else "skipped"
+    else:
+        status = "changed" if (create or edit) else "unchanged"
+    return {"status": status, "msgs": msgs, "create": create, "edit": edit,
+            "skipped": skipped, "orphans": orphans}
+
+
+def build_items(posts, keys, recs, general_key, tag_for, warnings):
+    items = []
+    for key in keys:
+        post, rec = posts[key], recs.get(key)
+        pl = plan_post(post, key == general_key, rec)
+        tag = tag_for(key)
+        if rec:
+            if rec.get("title") != post.title:
+                warnings.add(f"{post.title}: the published post is titled '{rec['title']}' - a webhook can't "
+                             f"rename posts, rename it by hand")
+            if rec.get("tag") != tag:
+                warnings.add(f"{post.title}: its tier tag changed ({rec.get('tag')} -> {tag}) - "
+                             f"change the tag on the post by hand")
+        for m in pl["skipped"]:
+            warnings.add(f"{post.title}: message '{m}' is {len(pl['msgs'][m])} characters "
+                         f"(limit {MSG_LIMIT}) - skipped")
+        for m in pl["orphans"]:
+            warnings.add(f"{post.title}: message '{m}' is no longer part of the post - delete it by hand")
+        items.append({"key": key, "post": post, "plan": pl, "tag": tag, "rec": rec,
+                      "split": key == general_key, "image": None})
+    return items
+
+
+def todo_of(items):
+    return [i for i in items if i["plan"]["status"] in ("new", "changed")]
+
+
+def attach_images(items, cfg):
+    for it in items:
+        if it["plan"]["status"] == "new":
+            it["image"] = resolve_image(cfg, it["post"].title)
+
+
+def print_plan(items):
+    todo = todo_of(items)
+    for it in todo:
+        pl, post, key = it["plan"], it["post"], it["key"]
+        kind = "Tier post" if key.startswith("tier:") else "Killer"
+        if pl["status"] == "new":
+            extra = f"{len(pl['create'])} message(s), picture: {it['image'].name if it['image'] else 'none'}, " \
+                    f"tag: {it['tag'] or 'none'}"
+            print(f"[CREATE ] {kind}: {post.title}  ({extra})")
+        else:
+            what = []
+            if pl["edit"]:
+                what.append("edit " + ", ".join(pl["edit"]))
+            if pl["create"]:
+                what.append("add " + ", ".join(pl["create"]))
+            print(f"[EDIT   ] {kind}: {post.title}  ({'; '.join(what)})")
+            rem, add = diff_lines(it["rec"].get("lines", []), post.flat())
+            order = []
+            for r in rem + add:
+                if r[0] not in order:
+                    order.append(r[0])
+            for sec in order:
+                for r in (r for r in rem if r[0] == sec):
+                    print(f"      - {sec}: {r[2]}")
+                for a in (a for a in add if a[0] == sec):
+                    print(f"      + {sec}: {a[2]}")
+    unchanged = sum(1 for i in items if i["plan"]["status"] == "unchanged")
+    if unchanged:
+        print(f"({unchanged} unchanged)")
+    if not todo:
+        print("Nothing to publish here.")
+
+
+def create_thread(api, post, image, tag_id):
+    payload = {"thread_name": post.title[:TITLE_LIMIT], "allowed_mentions": {"parse": []}}
+    if tag_id:
+        payload["applied_tags"] = [tag_id]
+    files = None
+    if image:
+        fname = "picture" + image.suffix.lower()
+        payload["attachments"] = [{"id": 0, "filename": fname}]
+        files = [(fname, image.read_bytes(), mimetypes.guess_type(image.name)[0] or "application/octet-stream")]
+    else:
+        payload["content"] = post.title      # a post needs a first message
+    return api.request("POST", query={"wait": "true"}, payload=payload, files=files)["channel_id"]
+
+
+def publish_one(api, ledger, entry, it, cfg, stats):
+    key, post, pl = it["key"], it["post"], it["plan"]
+    rec = entry["posts"].get(key)
+    if rec is None:
+        tag_id = cfg.get("tag_ids", {}).get(it["tag"]) if it["tag"] else None
+        tid = create_thread(api, post, it.get("image"), tag_id)
+        rec = {"title": post.title, "thread_id": tid, "tag": it["tag"], "messages": {}, "lines": []}
+        entry["posts"][key] = rec
+        save_ledger(ledger)
+        stats["created"] += 1
+        print(f"  created: {thread_link(entry, tid)}")
+    for m in pl["create"]:
+        msg = api.request("POST", query={"wait": "true", "thread_id": rec["thread_id"]},
+                          payload={"content": pl["msgs"][m], "allowed_mentions": {"parse": []}})
+        rec["messages"][m] = {"id": msg["id"], "hash": sha(pl["msgs"][m])}
+        save_ledger(ledger)
+        stats["added"] += 1
+    for m in pl["edit"]:
+        api.request("PATCH", f"/messages/{rec['messages'][m]['id']}", query={"thread_id": rec["thread_id"]},
+                    payload={"content": pl["msgs"][m], "allowed_mentions": {"parse": []}})
+        rec["messages"][m]["hash"] = sha(pl["msgs"][m])
+        save_ledger(ledger)
+        stats["edited"] += 1
+    rec["lines"] = post.flat()
+    save_ledger(ledger)
+
+
+def publish_items(api, ledger, entry, items, cfg, stats):
+    todo = todo_of(items)
+    for n, it in enumerate(todo, 1):
+        print(f"[{n}/{len(todo)}] {it['post'].title}")
+        try:
+            publish_one(api, ledger, entry, it, cfg, stats)
+        except DiscordError as e:
+            if e.status == 404 and entry["posts"].get(it["key"]) and not it.get("retried"):
+                print("  ! That post no longer exists on Discord - creating it again.")
+                entry["posts"].pop(it["key"])
+                save_ledger(ledger)
+                it["plan"] = plan_post(it["post"], it["split"], None)
+                it["image"] = resolve_image(cfg, it["post"].title)
+                it["retried"] = True
+                publish_one(api, ledger, entry, it, cfg, stats)
+            else:
+                raise
+
+
+def go_ahead(items, args):
+    if not todo_of(items):
+        return False
+    if args.dry_run:
+        print("(dry run - nothing was sent)")
+        return False
+    if args.yes:
+        return True
+    if not sys.stdin.isatty():
+        print("Run this in a terminal to confirm, or pass --yes.")
+        return False
+    print()
+    return confirm("Publish these?")
+
+
+def run_publish(args, d, ruleset, hook):
+    cfg = load_config()
+    api = Discord(hook)
+    print("\nContacting Discord ...")
+    try:
+        info = api.request("GET")
+    except DiscordError as e:
+        sys.exit(f"Could not use that webhook: {e}\n(If it was deleted, make a new one and run: "
+                 f"python bbdjson2human.py --set-webhook)")
+    ledger = load_ledger()
+    entry = ledger.setdefault(hook["id"], {})
+    entry["guild_id"], entry["channel_id"] = info.get("guild_id"), info.get("channel_id")
+    entry.setdefault("posts", {})
+    save_ledger(ledger)
+
+    if args.set_images is not None:
+        if args.set_images == "ASK":
+            if not sys.stdin.isatty():
+                sys.exit("--set-images needs a folder: --set-images <folder>")
+            cfg["images_dir"] = input("Folder with your post pictures (Enter = no pictures): ").strip().strip('"')
+        else:
+            cfg["images_dir"] = args.set_images
+        save_config(cfg)
+    ask_tag_ids(cfg, args.set_tags)
+
+    tiers = ruleset["Tiers"]
+    general_key = f"tier:{tiers[0]['Name']}"
+    tier_posts = build_tier_posts(ruleset, d)
+    tier_keys = list(tier_posts)
+    killers = [k for k in ruleset["KillerOverride"] if not k.get("IsDisabled")]
+    for k in ruleset["KillerOverride"]:
+        if k.get("IsDisabled"):
+            d.warnings.add(f"{k['Name']} is disabled in the ruleset - no post generated")
+    if args.test:
+        tier_keys = [general_key] + [k for k in tier_keys if k != general_key][:1]
+        killers = killers[:1]
+        print("TEST MODE: publishing only "
+              + ", ".join(tier_posts[k].title for k in tier_keys) + " and " + killers[0]["Name"] + ".")
+    letters = {f"tier:{t['Name']}": (None if i == 0 else str(t["Name"]).upper()) for i, t in enumerate(tiers)}
+    stats = {"created": 0, "added": 0, "edited": 0}
+
+    try:
+        # --- 1) tier posts first
+        print("\n== Tier posts ==")
+        items = build_items(tier_posts, tier_keys, entry["posts"], general_key, letters.get, d.warnings)
+        attach_images(items, cfg)
+        print_plan(items)
+        todo_before = bool(todo_of(items))
+        sent = go_ahead(items, args)
+        if sent:
+            publish_items(api, ledger, entry, items, cfg, stats)
+        elif todo_before and not args.dry_run:
+            print("Stopped - nothing was published.")
+            return
+
+        # --- 2) killer posts, with links to the tier posts
+        links = {key[5:]: thread_link(entry, rec["thread_id"])
+                 for key, rec in entry["posts"].items() if key.startswith("tier:") and rec.get("thread_id")}
+        killer_posts, killer_tag = {}, {}
+        for k in killers:
+            key = f"killer:{k['Name']}"
+            killer_posts[key] = killer_post(k, d, ruleset, links)
+            killer_tag[key] = killer_tier_letter(k, ruleset)
+            if killer_tag[key] is None:
+                d.warnings.add(f"{k['Name']}: killer and survivor tiers share no single letter - no tier tag")
+        print("\n== Killer posts ==")
+        if args.dry_run and todo_before:
+            print("(dry run: this assumes the tier post links as they are published right now)")
+        kitems = build_items(killer_posts, list(killer_posts), entry["posts"], None, killer_tag.get, d.warnings)
+        attach_images(kitems, cfg)
+        print_plan(kitems)
+        if go_ahead(kitems, args):
+            publish_items(api, ledger, entry, kitems, cfg, stats)
+    except DiscordError as e:
+        hint = ""
+        if e.code == 50035 or "tag" in e.text.lower():
+            hint = "\nIf this is about tags, check the tag IDs (python bbdjson2human.py --set-tags)."
+        sys.exit(f"\nStopped: {e}{hint}\nEverything published so far is saved; run again to continue.")
+
+    print(f"\nDone: {stats['created']} post(s) created, {stats['added']} message(s) added, "
+          f"{stats['edited']} message(s) edited.")
+    if d.warnings:
+        print("\nWarnings:")
+        for w in sorted(d.warnings):
+            print("  !", w)
 
 
 # ----------------------------------------------------------------------------
@@ -823,18 +1319,32 @@ def main():
                     help="ask for every tier post's link again (Enter keeps the saved one)")
     ap.add_argument("--no-links", action="store_true",
                     help="never ask for tier post links (saved links are still used)")
+    ap.add_argument("--no-publish", action="store_true",
+                    help="write post files instead of publishing to Discord")
+    ap.add_argument("--set-webhook", nargs="?", const="ASK", default=None, metavar="URL",
+                    help="change the saved webhook URL (give the URL, or leave empty to be asked)")
+    ap.add_argument("--set-tags", action="store_true", help="enter the tier tag IDs again")
+    ap.add_argument("--set-images", nargs="?", const="ASK", default=None, metavar="FOLDER",
+                    help="change the folder with your post pictures")
+    ap.add_argument("--test", action="store_true",
+                    help="publish only 3 posts (General, one tier post, one killer) to try things out")
+    ap.add_argument("--dry-run", action="store_true", help="show what would be published, send nothing")
+    ap.add_argument("--yes", action="store_true", help="don't ask for confirmation before publishing")
     ap.add_argument("--since", help="compare against this GitHub commit id instead of the saved one")
     args = ap.parse_args()
 
     if not args.no_data_update:
         sync_data(Path(args.data))
     d = Data(args.data)
+    hook = None if args.no_publish else get_webhook(args.set_webhook)
     local = bool(args.source)
     latest = None
     old_rs = None
 
     if local:
         new_rs = json.loads(Path(args.source).read_text(encoding="utf-8-sig"))
+        if hook:
+            return run_publish(args, d, new_rs, hook)
         print(f"Using local file {args.source} (no comparison, nothing is saved).")
     else:
         url = get_ruleset_url(args.set_url)
@@ -843,6 +1353,9 @@ def main():
         commits = get_commits(gh)
         latest = commits[0]
         new_rs = fetch_ruleset(gh, latest["sha"])
+        if hook:
+            print(f"Latest version: {latest['sha'][:7]}  ({latest['date']})")
+            return run_publish(args, d, new_rs, hook)
         state = load_state()
         if state.get("url") and state["url"] != url:
             print("(Your saved 'last posted' version belongs to a different ruleset link - ignoring it.)")
